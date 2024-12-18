@@ -7,7 +7,11 @@
 
 #include <ATen/ATen.h>
 #include <fcntl.h>
+#if defined(__x86_64__)
 #include <immintrin.h>
+#elif defined(__powerpc__)
+#include <altivec.h>
+#endif
 #include <semaphore.h>
 #include <sys/mman.h>
 #include "shm.h"
@@ -114,14 +118,16 @@ void wait_buffer_state_until_2(int index,
         if (cur_state == state0 || cur_state == state1) break;
     }
 }
-
+#if defined (__x86_64__)
 __m512 cvt_bf16_to_fp32(const __m256i src) __attribute__((target("avx512bw")));
 inline __m512 cvt_bf16_to_fp32(const __m256i src)
 {
     auto y = _mm512_cvtepu16_epi32(src);
     return _mm512_castsi512_ps(_mm512_bslli_epi128(y, 2));
 }
+#endif
 
+#if defined (__x86_64__)
 inline __m256i cvt_fp32_to_bf16(const __m512 src) __attribute__((target("avx512bw")));
 inline __m256i cvt_fp32_to_bf16(const __m512 src)
 {
@@ -160,6 +166,9 @@ void reduce_fp16_buffers(int start_elements, int num_elements, char* to_buffer, 
 
 void reduce_fp32_buffers(int start_elements, int num_elements, char* to_buffer, char** buffers)
     __attribute__((target("avx512bw")));
+#elif defined(__powerpc__)
+void reduce_fp32_buffers(int start_elements, int num_elements, char* to_buffer, char** buffers);
+#endif
 
 void reduce_all_buffers(int start_elements,
                         int num_elements,
@@ -169,12 +178,14 @@ void reduce_all_buffers(int start_elements,
                         char** buffers)
 {
     switch (scalar_type) {
+#if defined(__x86_64)
         case c10::ScalarType::BFloat16:
             reduce_bf16_buffers(start_elements, num_elements, to_buffer, buffers);
             break;
         case c10::ScalarType::Half:
             reduce_fp16_buffers(start_elements, num_elements, to_buffer, buffers);
             break;
+#endif
         case c10::ScalarType::Float:
             reduce_fp32_buffers(start_elements, num_elements, to_buffer, buffers);
             break;
@@ -192,8 +203,13 @@ void reduce_all_buffers(int start_elements,
 // iteration depends on vector length.  256bit vector ==> 32 bytes, 512bit vector ==> 64 bytes
 // If you change implementation of reduce_bf16_buffers, etc. , check whether this number needs
 // to be changed
+#if defined(__x86_64)
 #define VECTOR_LENGTH_IN_BYTES 32
+#elif defined(__powerpc__)
+#define VECTOR_LENGTH_IN_BYTES 16
+#endif
 
+#if defined(__x86_64__)
 void reduce_bf16_buffers(int start_elements, int num_elements, char* to_buffer, char** buffers)
 {
     const int element_size = 2;
@@ -242,7 +258,6 @@ void reduce_bf16_buffers(int start_elements, int num_elements, char* to_buffer, 
         i += element_size;
     }
 }
-
 #define CVT_ADD_FP16(x)                                                                      \
     do {                                                                                     \
         auto in##x##_val = cvt_fp16_to_fp32(_mm256_loadu_si256((__m256i*)(buffers[x] + i))); \
@@ -297,13 +312,18 @@ void reduce_fp16_buffers(int start_elements, int num_elements, char* to_buffer, 
         i += element_size;
     }
 }
-
 #define CVT_ADD_F32(x)                                                \
     do {                                                              \
         auto in##x##_val = _mm256_loadu_ps((float*)(buffers[x] + i)); \
         inout_val = _mm256_add_ps(inout_val, in##x##_val);            \
     } while (0)
-
+#elif defined(__powerpc__)
+#define CVT_ADD_F32(x)                                                 \
+    do {                                                               \
+        __vector float in##x##_val = vec_vsx_ld(0, (float*)(buffers[x] + i)); \
+        inout_val = vec_add(inout_val, in##x##_val);                   \
+    } while (0)
+#endif
 void reduce_fp32_buffers(int start_elements, int num_elements, char* to_buffer, char** buffers)
 {
     const int element_size = 4;
@@ -315,7 +335,11 @@ void reduce_fp32_buffers(int start_elements, int num_elements, char* to_buffer, 
 #pragma omp parallel for
     for (int i = start_elements * element_size; i < (start_elements + main_elements) * element_size;
          i += VECTOR_LENGTH_IN_BYTES) {
+#if defined(__x86_64)
         auto inout_val = _mm256_loadu_ps((float*)(buffers[0] + i));
+#elif defined(__powerpc__)
+     __vector float inout_val = vec_vsx_ld(0, (float*)(buffers[0] + i));    // Load first 128 bits (4 floats)
+#endif
         switch (world_size) {
             case 16: CVT_ADD_F32(15);
             case 15: CVT_ADD_F32(14);
@@ -334,12 +358,24 @@ void reduce_fp32_buffers(int start_elements, int num_elements, char* to_buffer, 
             case 2: CVT_ADD_F32(1);
             case 1: break;
             default:
+#if defined(__x86_64__)
                 for (int j = 1; j < world_size; j++) {
                     auto in_val = _mm256_loadu_ps((float*)(buffers[j] + i));
                     inout_val = _mm256_add_ps(inout_val, in_val);
                 }
+#elif defined(__powerpc__)
+                for (int j = 1; j < world_size; j++) {
+                    __vector float in_val = vec_vsx_ld(0, (float*)(buffers[j] + i));    // Load first 128 bits (4 floats)
+                    inout_val = vec_add(inout_val, in_val);
+		}
+#endif
         }
+#if defined(__x86_64__)
         _mm256_storeu_ps((float*)(to_buffer + i), inout_val);
+#elif defined(__powerpc__)
+        vec_vsx_st(inout_val, 0, (float*)(to_buffer + i));
+#endif
+
     }
 
     // process remaining part
@@ -411,17 +447,26 @@ void shm_initialize(int size, int rank, char* addr_string, char* port_string)
         distributed_buffer[1][i] = workspace[i]->buffer + BUFFER1_OFFSET(1);
     }
 }
-
+#if defined(__x86_64__)
 static void parallel_memcpy(void* to, void* from, size_t n_bytes)
     __attribute__((target("avx512bw")));
+#elif defined(__powerpc__)
+static void parallel_memcpy(void* to, void* from, size_t n_bytes);
+#endif
 static void parallel_memcpy(void* to, void* from, size_t n_bytes)
 {
     auto aligned_bytes = n_bytes - (n_bytes % VECTOR_LENGTH_IN_BYTES);
     // process aligned part
 #pragma omp parallel for
     for (int i = 0; i < aligned_bytes; i += VECTOR_LENGTH_IN_BYTES) {
+#if defined(__x86_64__)
         auto val = _mm256_loadu_si256((__m256i*)((char*)from + i));
         _mm256_storeu_si256((__m256i*)((char*)to + i), val);
+#elif defined(__powerpc__)
+        auto val = vec_vsx_ld(0, (unsigned char*)from + i);
+        vec_vsx_st(val, 0, (unsigned char*)to + i);
+#endif
+
     }
 
     // process remaining part
